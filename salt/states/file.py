@@ -919,7 +919,7 @@ def recurse(name,
     return ret
 
 def sed(name, before, after, limit='', backup='.bak', options='-r -e',
-        flags='g'):
+        flags='g', single=False):
     '''
     Maintain a simple edit to a file
 
@@ -928,6 +928,11 @@ def sed(name, before, after, limit='', backup='.bak', options='-r -e',
     successful using :mod:`salt.modules.file.contains`. In general the
     ``limit`` pattern should be as specific as possible and ``before`` and
     ``after`` should contain the minimal text to be changed.
+
+    By default sed assumes that there may be multiple instances in the file that
+    should be operated on. By setting ``single`` to true you indicate that there
+    will only ever be one instance matched by limit and that sed should not
+    continue if ``after`` already matches in the file.
 
     Usage::
 
@@ -941,10 +946,20 @@ def sed(name, before, after, limit='', backup='.bak', options='-r -e',
 
         # Remove ldap from nsswitch
         /etc/nsswitch.conf:
-        file:
+          file:
             - sed
             - before: 'ldap'
             - after: ''
+            - limit: '^passwd:'
+
+
+        # Force passwd to only use files in nsswitch
+        /etc/nsswitch.conf:
+          file:
+            - sed
+            - single: true
+            - before: 'passwd:.*'
+            - after: "passwd:\tfiles"
             - limit: '^passwd:'
 
     .. versionadded:: 0.9.5
@@ -963,8 +978,15 @@ def sed(name, before, after, limit='', backup='.bak', options='-r -e',
     # sed returns no output if the edit matches anything or not so we'll have
     # to look for ourselves
 
+    # if single is True then we want to try any match after first since the
+    # user has indicated only one instance of limit will exist in the file
+    if single and __salt__['file.contains'](name, after, limit):
+        ret['comment'] = "Edit already performed"
+        ret['result'] = True
+        return ret
+
     # Look for the pattern before attempting the edit
-    if not __salt__['file.contains'](name, before, limit):
+    if not single and not __salt__['file.contains'](name, before, limit):
         # Pattern not found; try to guess why
         if __salt__['file.contains'](name, after, limit):
             ret['comment'] = "Edit already performed"

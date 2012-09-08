@@ -1,7 +1,7 @@
 '''
 Pure python state renderer
 
-The sls file should contain a function called ``sls`` which returns high state
+The sls file should contain a function called ``run`` which returns high state
 data
 '''
 
@@ -31,6 +31,6 @@ def render(template, env='', sls=''):
             sls=sls)
     if not tmp_data.get('result', False):
         raise SaltRenderError(tmp_data.get('data',
-            'Unknown render error in yaml_jinja renderer'))
+            'Unknown render error in py renderer'))
 
     return tmp_data['data']

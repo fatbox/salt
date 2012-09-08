@@ -2,7 +2,8 @@
 Top level package command wrapper, used to translate the os detected by the
 grains to the correct service manager
 '''
-
+# Import Salt Libs
+import salt.utils
 
 def __virtual__():
     '''
@@ -95,6 +96,8 @@ def restart(name):
 
         salt '*' service.restart <service name>
     '''
+    if name == 'salt-minion':
+        salt.utils.daemonize_if(__opts__)
     cmd = '/etc/init.d/{0} restart'.format(name)
     return not __salt__['cmd.retcode'](cmd)
 

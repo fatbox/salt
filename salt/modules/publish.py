@@ -2,23 +2,13 @@
 Publish a command from a minion to a target
 '''
 
-import zmq
+# Import python libs
 import ast
 
+# Import salt libs
 import salt.crypt
 import salt.payload
-from salt._compat import string_types
-
-
-def _get_socket():
-    '''
-    Return the ZeroMQ socket to use
-    '''
-    context = zmq.Context()
-    socket = context.socket(zmq.REQ)
-    socket.connect(__opts__['master_uri'])
-    return socket
-
+from salt._compat import string_types, integer_types
 
 def _publish(
         tgt,
@@ -45,24 +35,14 @@ def _publish(
 
         salt system.example.com publish.publish '*' cmd.run 'ls -la /tmp'
     '''
-    serial = salt.payload.Serial(__opts__)
     if fun == 'publish.publish':
         # Need to log something here
         return {}
+    arg = normalize_arg(arg)
 
-    if not arg:
-        arg = []
-
-    try:
-        if isinstance(ast.literal_eval(arg), dict):
-            arg = [arg,]
-    except Exception:
-        if isinstance(arg, string_types):
-            arg = arg.split(',')
-
+    sreq = salt.payload.SREQ(__opts__['master_uri'])
     auth = salt.crypt.SAuth(__opts__)
     tok = auth.gen_token('salt')
-    payload = {'enc': 'aes'}
     load = {
             'cmd': 'minion_publish',
             'fun': fun,
@@ -74,11 +54,22 @@ def _publish(
             'tmo': timeout,
             'form': form,
             'id': __opts__['id']}
-    payload['load'] = auth.crypticle.dumps(load)
-    socket = _get_socket()
-    socket.send(serial.dumps(payload))
-    return auth.crypticle.loads(serial.loads(socket.recv()))
+    return auth.crypticle.loads(
+            sreq.send('aes', auth.crypticle.dumps(load), 1))
 
+def normalize_arg(arg):
+    if not arg:
+        arg = []
+
+    try:
+        # Numeric checks here because of all numeric strings, like JIDs
+        if isinstance(ast.literal_eval(arg), (dict,integer_types,long)):
+            arg = [arg,]
+    except Exception:
+        if isinstance(arg, string_types):
+            arg = arg.split(',')
+
+    return arg
 
 def publish(tgt, fun, arg=None, expr_form='glob', returner='', timeout=5):
     '''
@@ -122,27 +113,16 @@ def runner(fun, arg=None):
 
         salt publish.runner manage.down
     '''
-    serial = salt.payload.Serial(__opts__)
-    if not arg:
-        arg = []
+    arg = normalize_arg(arg)
 
-    try:
-        if isinstance(ast.literal_eval(arg), dict):
-            arg = [arg,]
-    except Exception:
-        if isinstance(arg, string_types):
-            arg = arg.split(',')
-
+    sreq = salt.payload.SREQ(__opts__['master_uri'])
     auth = salt.crypt.SAuth(__opts__)
     tok = auth.gen_token('salt')
-    payload = {'enc': 'aes'}
     load = {
             'cmd': 'minion_runner',
             'fun': fun,
             'arg': arg,
             'tok': tok,
             'id': __opts__['id']}
-    payload['load'] = auth.crypticle.dumps(load)
-    socket = _get_socket()
-    socket.send(serial.dumps(payload))
-    return auth.crypticle.loads(serial.loads(socket.recv()))
+    return auth.crypticle.loads(
+            sreq.send('aes', auth.crypticle.dumps(load), 1))

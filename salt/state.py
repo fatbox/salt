@@ -1,7 +1,7 @@
 '''
-The module used to execute states in salt. A state is unlike a module execution
-in that instead of just executing a command it ensure that a certain state is
-present on the system.
+The module used to execute states in salt. A state is unlike a module
+execution in that instead of just executing a command it ensure that a
+certain state is present on the system.
 
 The data sent to the state calls is as follows:
     { 'state': '<state module name>',
@@ -20,9 +20,6 @@ import logging
 import collections
 import traceback
 
-# Import Third Party libs
-import zmq
-
 # Import Salt libs
 import salt.utils
 import salt.loader
@@ -32,6 +29,7 @@ import salt.fileclient
 from salt._compat import string_types, callable
 
 from salt.template import compile_template, compile_template_str
+from salt.exceptions import SaltReqTimeoutError
 
 log = logging.getLogger(__name__)
 
@@ -245,7 +243,7 @@ class State(object):
         Check to see if the modules for this state instance need to be
         updated, only update if the state is a file. If the function is
         managed check to see if the file is a possible module type, e.g. a
-        python, pyx, or .so. Always refresh if the function is recuse,
+        python, pyx, or .so. Always refresh if the function is recurse,
         since that can lay down anything.
         '''
         def _refresh():
@@ -266,21 +264,6 @@ class State(object):
         elif data['state'] == 'pkg':
             _refresh()
 
-    def format_verbosity(self, returns):
-        '''
-        Check for the state_verbose option and strip out the result=True
-        and changes={} members of the state return list.
-        '''
-        if self.opts['state_verbose']:
-            return returns
-        rm_tags = []
-        for tag in returns:
-            if returns[tag]['result'] and not returns[tag]['changes']:
-                rm_tags.append(tag)
-        for tag in rm_tags:
-            returns.pop(tag)
-        return returns
-
     def verify_data(self, data):
         '''
         Verify the data, return an error statement if something is wrong
@@ -299,13 +282,6 @@ class State(object):
             errors.append(err)
         if errors:
             return errors
-        if data['fun'].startswith('mod_'):
-            errors.append(
-                    'State {0} in sls {1} uses an invalid function {2}'.format(
-                        data['state'],
-                        data['__sls__'],
-                        data['fun'])
-                    )
         full = data['state'] + '.' + data['fun']
         if full not in self.states:
             if '__sls__' in data:
@@ -342,8 +318,14 @@ class State(object):
         if 'watch' in data:
             # Check to see if the service has a mod_watch function, if it does
             # not, then just require
+            # to just require extend the require statement with the contents
+            # of watch so that the mod_watch function is not called and the
+            # requisite capability is still used
             if not '{0}.mod_watch'.format(data['state']) in self.states:
-                data['require'] = data.pop('watch')
+                if 'require' in data:
+                    data['require'].extend(data.pop('watch'))
+                else:
+                    data['require'] = data.pop('watch')
                 reqdec = 'require'
             else:
                 reqdec = 'watch'
@@ -748,6 +730,11 @@ class State(object):
                                             continue
                                         if next(iter(arg)) in ignore_args:
                                             continue
+                                        # Don't use name or names
+                                        if arg.keys()[0] == 'name':
+                                            continue
+                                        if arg.keys()[0] == 'names':
+                                            continue
                                         extend[ext_id][_state].append(arg)
                                     continue
                                 if key == 'use':
@@ -768,6 +755,11 @@ class State(object):
                                         if len(arg) != 1:
                                             continue
                                         if next(iter(arg)) in ignore_args:
+                                            continue
+                                        # Don't use name or names
+                                        if arg.keys()[0] == 'name':
+                                            continue
+                                        if arg.keys()[0] == 'names':
                                             continue
                                         extend[id_][state].append(arg)
                                     continue
@@ -800,6 +792,22 @@ class State(object):
         Call a state directly with the low data structure, verify data
         before processing.
         '''
+        errors = self.verify_data(data)
+        if errors:
+            ret = {
+                'result': False,
+                'name': data['name'],
+                'changes': {},
+                'comment': '',
+                }
+            for err in errors:
+                ret['comment'] += '{0}\n'.format(err)
+            ret['__run_num__'] = self.__run_num
+            self.__run_num += 1
+            format_log(ret)
+            self.module_refresh(data)
+            return ret
+
         log.info(
                 'Executing state {0[state]}.{0[fun]} for {0[name]}'.format(
                     data
@@ -828,6 +836,7 @@ class State(object):
         format_log(ret)
         if 'provider' in data:
             self.load_modules()
+        self.module_refresh(data)
         return ret
 
     def call_chunks(self, chunks):
@@ -869,7 +878,6 @@ class State(object):
         if not present:
             return 'met'
         reqs = {'require': [], 'watch': []}
-        status = 'unmet'
         for r_state in reqs:
             if r_state in low:
                 for req in low[r_state]:
@@ -974,6 +982,7 @@ class State(object):
         elif status == 'change':
             ret = self.call(low)
             if not ret['changes']:
+                low['sfun'] = low['fun']
                 low['fun'] = 'mod_watch'
                 ret = self.call(low)
             running[tag] = ret
@@ -985,7 +994,6 @@ class State(object):
         '''
         Process a high data call and ensure the defined states.
         '''
-        err = []
         errors = []
         # If there is extension data reconcile it
         high, ext_errors = self.reconcile_extend(high)
@@ -1000,12 +1008,11 @@ class State(object):
             return errors
         # Compile and verify the raw chunks
         chunks = self.compile_high_data(high)
-        errors += self.verify_chunks(chunks)
         # If there are extensions in the highstate, process them and update
         # the low data chunks
         if errors:
             return errors
-        ret = self.format_verbosity(self.call_chunks(chunks))
+        ret = self.call_chunks(chunks)
         return ret
 
     def call_template(self, template):
@@ -1013,7 +1020,7 @@ class State(object):
         Enforce the states in a template
         '''
         high = compile_template(
-            template, self.renderers, self.opts['renderer'])
+            template, self.rend, self.opts['renderer'])
         if high:
             return self.call_high(high)
         return high
@@ -1023,7 +1030,7 @@ class State(object):
         Enforce the states in a template, pass the template as a string
         '''
         high = compile_template_str(
-            template, self.renderers, self.opts['renderer'])
+            template, self.rend, self.opts['renderer'])
         if high:
             return self.call_high(high)
         return high
@@ -1358,7 +1365,7 @@ class BaseHighState(object):
                             .format(name, sls)))
                         continue
                     skeys = set()
-                    for key in state[name]:
+                    for key in sorted(state[name]):
                         if key.startswith('_'):
                             continue
                         if not isinstance(state[name][key], list):
@@ -1477,9 +1484,12 @@ class BaseHighState(object):
         '''
         Return just the highstate or the errors
         '''
+        err = []
         top = self.get_top()
+        err += self.verify_tops(top)
         matches = self.top_matches(top)
         high, errors = self.render_highstate(matches)
+        err += errors
 
         if errors:
             return errors
@@ -1491,7 +1501,6 @@ class BaseHighState(object):
         Compile the highstate but don't run it, return the low chunks to
         see exactly what the highstate will execute
         '''
-        err = []
         top = self.get_top()
         matches = self.top_matches(top)
         high, errors = self.render_highstate(matches)
@@ -1503,12 +1512,12 @@ class BaseHighState(object):
         # Verify that the high data is structurally sound
         errors += self.state.verify_high(high)
 
-        # Compile and verify the raw chunks
-        chunks = self.state.compile_high_data(high)
-        errors += self.state.verify_chunks(chunks)
-
         if errors:
             return errors
+
+        # Compile and verify the raw chunks
+        chunks = self.state.compile_high_data(high)
+
         return chunks
 
 
@@ -1579,25 +1588,21 @@ class RemoteHighState(object):
         self.grains = grains
         self.serial = salt.payload.Serial(self.opts)
         self.auth = salt.crypt.SAuth(opts)
-        self.socket = self.__get_socket()
-
-    def __get_socket(self):
-        '''
-        Return the zeromq socket to use
-        '''
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.connect(self.opts['master_uri'])
-        return socket
+        self.sreq = salt.payload.SREQ(self.opts['master_uri'])
 
     def compile_master(self):
         '''
         Return the state data from the master
         '''
-        payload = {'enc': 'aes'}
         load = {'grains': self.grains,
                 'opts': self.opts,
                 'cmd': '_master_state'}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(self.sreq.send(
+                    'aes',
+                    self.auth.crypticle.dumps(load),
+                    3,
+                    72000))
+        except SaltReqTimeoutError:
+            return {}
+

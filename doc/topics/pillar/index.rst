@@ -16,7 +16,8 @@ structure of the file_roots used in the Salt file server. Like the
 Salt file server the ``pillar_roots`` option in the master config is based
 on environments mapping to directories. The pillar data is then mapped to
 minions based on matchers in a top file which is laid out in the same way
-as the state top file.
+as the state top file. Salt pillars can use the same matcher types as the
+standard top file.
 
 The configuration for the ``pillar_roots`` in the master config is identical in
 behavior and function as the ``file_roots`` configuration:
@@ -38,13 +39,10 @@ used for States, and has the same structure:
     base:
       '*':
         - packages
-      'someminion':
-        - someminion-specials
 
-This simple pillar top file declares that information for all minions can be
-found in the ``packages.sls`` file [#nokeyvalueintop]_, while
-``someminion-specials.sls`` contains overriding or additional information just
-for one special minion.
+This further example shows how to enable pcre matching in the salt pillar file. 
+The flexibility enabled by pcre matching is particularly useful in salt pillar
+files.
 
 ``/srv/pillar/packages.sls``
 
@@ -58,12 +56,6 @@ for one special minion.
     git: git-core
     {% endif %}
     somekey: globalvalue
-
-``/srv/pillar/someminion-specials.sls``
-
-.. code-block:: yaml
-
-    somekey: specialvalue
 
 Now this data can be used from within modules, renderers, State SLS files, and
 more via the shared pillar `dict`_:
@@ -112,6 +104,16 @@ this:
     somekey has value: {{ pillar['somekey'] }}
 
 .. _`dict`: http://docs.python.org/library/stdtypes.html#mapping-types-dict
+
+Viewing Minion Pillar
+=====================
+
+Once the pillar is set up the data can be viewed on the minion via the
+``pillar.data`` module:
+
+.. code-block:: bash
+
+    # salt '*' pillar.data
 
 Footnotes
 ---------

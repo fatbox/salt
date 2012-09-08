@@ -74,12 +74,12 @@ class SSHKnownHostsStateTest(integration.ModuleCase):
         '''
         ssh_known_hosts.absent
         '''
-        shutil.copyfile(
-             os.path.join(integration.FILES, 'ssh', 'known_hosts'),
-             KNOWN_HOSTS)
-        kwargs = {'name': 'github.com',
-                  'user': 'root',
-                  'config': KNOWN_HOSTS}
+        known_hosts = os.path.join(integration.FILES, 'ssh', 'known_hosts')
+        shutil.copyfile(known_hosts, KNOWN_HOSTS)
+        if not os.path.isfile(KNOWN_HOSTS):
+            self.skipTest("Unable to copy {0} to {1}".format(known_hosts, KNOWN_HOSTS))
+
+        kwargs = {'name': 'github.com', 'user': 'root', 'config': KNOWN_HOSTS}
         # test first
         _ret = self.run_state('ssh_known_hosts.absent', test=True, **kwargs)
         ret = list(_ret.values())[0]
@@ -99,14 +99,6 @@ class SSHKnownHostsStateTest(integration.ModuleCase):
         self.assertEqual(ret['result'], None, ret)
 
 
-if __name__ == "__main__":
-    import sys
-    from saltunittest import TestLoader, TextTestRunner
-    from integration import TestDaemon
-
-    loader = TestLoader()
-    tests = loader.loadTestsFromTestCase(SSHKnownHostsStateTest)
-    print('Setting up Salt daemons to execute tests')
-    with TestDaemon():
-        runner = TextTestRunner(verbosity=1).run(tests)
-        sys.exit(runner.wasSuccessful())
+if __name__ == '__main__':
+    from integration import run_tests
+    run_tests(SSHKnownHostsStateTest)

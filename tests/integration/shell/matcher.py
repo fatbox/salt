@@ -7,10 +7,12 @@ import integration
 from integration import TestDaemon
 
 
-class MatchTest(integration.ShellCase):
+class MatchTest(integration.ShellCase, integration.ShellCaseCommonTestsMixIn):
     '''
     Test salt matchers
     '''
+    _call_binary_ = 'salt'
+
     def test_list(self):
         '''
         test salt -L matcher
@@ -67,7 +69,9 @@ class MatchTest(integration.ShellCase):
         '''
         test salt grain matcher
         '''
-        data = self.run_salt('-t 1 --grain-pcre "test_grain:^cheese$" test.ping')
+        data = self.run_salt(
+            '-t 1 --grain-pcre "test_grain:^cheese$" test.ping'
+        )
         data = '\n'.join(data)
         self.assertIn('minion', data)
         self.assertNotIn('sub_minion', data)
@@ -112,10 +116,18 @@ class MatchTest(integration.ShellCase):
         data = '\n'.join(data)
         self.assertIn('minion', data)
 
+    def test_salt_documentation(self):
+        '''
+        Test to see if we're supporting --doc
+        '''
+        data = self.run_salt('-d user.add')
+        self.assertIn('user.add:', data)
+
+
 
 if __name__ == "__main__":
     loader = TestLoader()
-    tests = loader.loadTestsFromTestCase(KeyTest)
+    tests = loader.loadTestsFromTestCase(MatchTest)
     print('Setting up Salt daemons to execute tests')
     with TestDaemon():
         runner = TextTestRunner(verbosity=1).run(tests)

@@ -36,14 +36,14 @@ def managed(name,
 
     Also accepts any kwargs that the virtualenv module will.
 
-    .. code-block: yaml
+    .. code-block:: yaml
 
         /var/www/myvirtualenv.com:
           virtualenv.manage:
             - no_site_packages: True
             - requirements: salt://REQUIREMENTS.txt
     '''
-    ret = {'name': name, 'result': None, 'comment': '', 'changes': {}}
+    ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
 
     if not 'virtualenv.create' in __salt__:
         ret['result'] = False
@@ -67,9 +67,10 @@ def managed(name,
 
     # If it already exists, grab the version for posterity
     if venv_exists and clear:
-        ret['changes']['cleared_packages'] = __salt__['pip.freeze'](bin_env=name)
-        ret['changes']['old'] = __salt__['cmd.run_stderr'](
-                    '{0} -V'.format(venv_py)).strip('\n')
+        ret['changes']['cleared_packages'] = \
+            __salt__['pip.freeze'](bin_env=name)
+        ret['changes']['old'] = \
+            __salt__['cmd.run_stderr']('{0} -V'.format(venv_py)).strip('\n')
 
     # Create (or clear) the virtualenv
     if __opts__['test']:
@@ -78,7 +79,7 @@ def managed(name,
         return ret
 
     if not venv_exists or (venv_exists and clear):
-        __salt__['virtualenv.create'](name,
+        _ret = __salt__['virtualenv.create'](name,
                 venv_bin=venv_bin,
                 no_site_packages=no_site_packages,
                 system_site_packages=system_site_packages,
@@ -90,6 +91,7 @@ def managed(name,
                 prompt=prompt,
                 runas=runas)
 
+        ret['result'] = _ret['retcode']==0
         ret['changes']['new'] = __salt__['cmd.run_stderr'](
                 '{0} -V'.format(venv_py)).strip('\n')
 
@@ -103,10 +105,12 @@ def managed(name,
 
     # Populate the venv via a requirements file
     if requirements:
-        if requirements.startswith('salt://'):
-            requirements = __salt__['cp.cache_file'](requirements, __env__)
         before = set(__salt__['pip.freeze'](bin_env=name))
-        __salt__['pip.install'](requirements=requirements, bin_env=name, runas=runas, cwd=cwd)
+        _ret = __salt__['pip.install'](
+            requirements=requirements, bin_env=name, runas=runas, cwd=cwd
+        )
+        ret['result'] &= _ret['retcode']==0
+
         after = set(__salt__['pip.freeze'](bin_env=name))
 
         new = list(after - before)
@@ -116,7 +120,6 @@ def managed(name,
             ret['changes']['packages'] = {
                 'new': new if new else '',
                 'old': old if old else ''}
-    ret['result'] = True
     return ret
 
 manage = managed

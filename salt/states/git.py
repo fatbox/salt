@@ -5,6 +5,9 @@ Interaction with Git repositories.
 NOTE: This modules is under heavy development and the API is subject to change.
 It may be replaced with a generic VCS module if this proves viable.
 
+Important, before using git over ssh, make sure your remote host fingerprint
+exists in "~/.ssh/known_hosts" file.
+
 .. code-block:: yaml
 
     https://github.com/saltstack/salt.git:
@@ -30,20 +33,25 @@ def latest(name,
            rev=None,
            target=None,
            runas=None,
-           force=None):
+           force=None,
+           submodules=False,
+        ):
     '''
     Make sure the repository is cloned to the given directory and is up to date
 
     name
         Address of the remote repository as passed to "git clone"
     rev
-        The remote branch or revision to checkout after clone / before update
+        The remote branch, tag, or revision ID to checkout after
+        clone / before update
     target
         Name of the target directory where repository is about to be cloned
     runas
         Name of the user performing repository management operations
     force
-        Force git to clone into pre-existing directories (deletes contnents)
+        Force git to clone into pre-existing directories (deletes contents)
+    submodules
+        Update submodules on clone or branch change (Default: False)
     '''
     ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
     if not target:
@@ -65,9 +73,15 @@ def latest(name,
                     ret,
                     ('Repository {0} update is probably required (current '
                     'revision is {1})').format(target, current_rev))
+
+        pull_out = __salt__['git.pull'](target, user=runas)
+
         if rev:
-            __salt__['git.checkout'](target, rev)
-        __salt__['git.pull'](target, user=runas)
+            __salt__['git.checkout'](target, rev, user=runas)
+
+        if submodules:
+            __salt__['git.submodule'](target, user=runas, opts='--recursive')
+
         new_rev = __salt__['git.revision'](cwd=target, user=runas)
         if current_rev != new_rev:
             log.info('Repository {0} updated: {1} => {2}'.format(target,
@@ -76,16 +90,31 @@ def latest(name,
             ret['comment'] = 'Repository {0} updated'.format(target)
             ret['changes']['revision'] = '{0} => {1}'.format(
                     current_rev, new_rev)
+        else:
+            # Check that there was no error preventing the revision update
+            if 'error:' in pull_out:
+                return _fail(
+                    ret,
+                    'An error was thrown by git:\n{0}'.format(pull_out)
+                    )
     else:
         if os.path.isdir(target):
+            # git clone is required, but target exists -- however it is empty
+            if not os.listdir(target):
+                log.debug(
+                    'target {0} found, but not a git repository. Since empty,'
+                    ' automatically deleting.'.format(target))
+                shutil.rmtree(target)
+            # git clone is required, target exists but force is turned on
+            elif force:
+                log.debug(
+                    'target {0} found, but not a git repository. Since force option'
+                    ' is in use, deleting.'.format(target))
+                shutil.rmtree(target)
             # git clone is required, but target exists and is non-empty
-            if not force:
+            else:
                 return _fail(ret, 'Directory exists, is non-empty, and force '
                     'option not in use')
-            log.debug(
-                    'target {0} found, but not a git repository. force option'
-                    ' is in use, deleting {0}...'.format(target))
-            shutil.rmtree(target)
         else:
             # git clone is required
             log.debug(
@@ -100,13 +129,70 @@ def latest(name,
         result = __salt__['git.clone'](target, name, user=runas)
         if not os.path.isdir(target):
             return _fail(ret, result)
+
         if rev:
-            __salt__['git.checkout'](target, rev)
-        else:
-            message = 'Repository {0} cloned to {1}'.format(name, target)
-            log.info(message)
-            ret['comment'] = message
-            ret['changes']['new'] = name
+            __salt__['git.checkout'](target, rev, user=runas)
+
+        if submodules:
+            __salt__['git.submodule'](target, user=runas)
+
+        new_rev = __salt__['git.revision'](cwd=target, user=runas)
+
+        message = 'Repository {0} cloned to {1}'.format(name, target)
+        log.info(message)
+        ret['comment'] = message
+
+        ret['changes']['new'] = name
+        ret['changes']['revision'] = new_rev
+    return ret
+
+
+def present(name, bare=True, runas=None, force=False):
+    '''
+    Make sure the repository is present in the given directory
+
+    name
+        Name of the directory where the repository is about to be created
+    bare
+        Create a bare repository (Default: True)
+    runas
+        Name of the user performing repository management operations
+    force
+        Force create a new repository into an pre-existing non-git directory (deletes contents)
+    '''
+    ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
+
+    # If the named directory is a git repo return True
+    if os.path.isdir(name):
+        if bare and os.path.isfile('{0}/HEAD'.format(name)):
+            return ret
+        elif not bare and os.path.isdir('{0}/.git'.format(name)):
+            return ret
+        # Directory exists and is not a git repo, if force is set destroy the
+        # directory and recreate, otherwise throw an error
+        elif not force:
+            return _fail(ret,
+                         'Directory which does not contain a git repo '
+                         'is already present at {0}. To delete this '
+                         'directory and create a fresh git repo set '
+                         'force: True'.format(name))
+
+    # Run test is set
+    if __opts__['test']:
+        ret['changes']['new repository'] = name
+        return _neutral_test(ret, 'New git repo set for creation at {0}'.format(name))
+
+    if os.path.isdir(name) and force:
+        shutil.rmtree(name)
+
+    opts = '--bare' if bare else ''
+    __salt__['git.init'](cwd=name, user=runas, opts=opts)
+
+    message = 'Initialized repository {0}'.format(name)
+    log.info(message)
+    ret['changes']['new repository'] = name
+    ret['comment'] = message
+
     return ret
 
 

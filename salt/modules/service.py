@@ -2,8 +2,11 @@
 The default service module, if not otherwise specified salt will fall back
 to this basic module
 '''
-
+# Import Python libs
 import os
+# Import Salt libs
+import salt.utils
+
 
 grainmap = {
            'Arch': '/etc/rc.d',
@@ -13,6 +16,7 @@ grainmap = {
            'Ubuntu': '/etc/init.d',
            'Gentoo': '/etc/init.d',
            'CentOS': '/etc/init.d',
+           'Amazon': '/etc/init.d',
            'SunOS': '/etc/init.d',
           }
 
@@ -24,14 +28,17 @@ def __virtual__():
     disable = [
                'RedHat',
                'CentOS',
+               'Amazon',
                'Scientific',
                'Fedora',
                'Gentoo',
                'Ubuntu',
-               'FreeBSD',
-               'Windows',
+               'Debian',
               ]
     if __grains__['os'] in disable:
+        return False
+    # Disable on all non-Linux OSes as well
+    if __grains__['kernel'] != 'Linux':
         return False
     return 'service'
 
@@ -70,6 +77,8 @@ def restart(name):
 
         salt '*' service.restart <service name>
     '''
+    if name == 'salt-minion':
+        salt.utils.daemonize_if(__opts__)
     cmd = os.path.join(grainmap[__grains__['os']],
             name + ' restart')
     return not __salt__['cmd.retcode'](cmd)

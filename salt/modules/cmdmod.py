@@ -4,11 +4,15 @@ A module for shelling out
 Keep in mind that this module is insecure, in that it can give whomever has
 access to the master root execution access to all salt minions
 '''
-
+# Import Python libs
+import pipes
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
+
+# Import Salt libs
 import salt.utils
 from salt.exceptions import CommandExecutionError
 from salt.grains.extra import shell as shell_grain
@@ -57,6 +61,13 @@ def _run(cmd,
     if not cwd:
         cwd = os.path.expanduser('~{0}'.format('' if not runas else runas))
 
+        # make sure we can access the cwd
+        # when run from sudo or another environment where the euid is
+        # changed ~ will expand to the home of the original uid and
+        # the euid might not have access to it. See issue #1844
+        if not os.access(cwd, os.R_OK):
+            cwd = '/'
+
     if 'os' in os.environ and not os.environ['os'].startswith('Windows'):
         if not os.path.isfile(shell) or not os.access(shell, os.X_OK):
             msg = 'The shell {0} is not available'.format(shell)
@@ -77,7 +88,7 @@ def _run(cmd,
         # Save the original command before munging it
         orig_cmd = cmd
         try:
-            p = pwd.getpwnam(runas)
+            pwd.getpwnam(runas)
         except KeyError:
             msg = 'User \'{0}\' is not available'.format(runas)
             raise CommandExecutionError(msg)
@@ -90,7 +101,7 @@ def _run(cmd,
             cmd = 'cd {0} && {1}'.format(cwd, cmd)
 
         cmd_prefix += ' {0} -c'.format(runas)
-        cmd = '{0} "{1}"'.format(cmd_prefix, cmd)
+        cmd = '{0} {1}'.format(cmd_prefix, pipes.quote(cmd))
 
     if not quiet:
         # Put the most common case first
@@ -233,6 +244,86 @@ def retcode(cmd, cwd=None, runas=None, shell=DEFAULT_SHELL, env=()):
             retcode=True
             )['retcode']
 
+
+def script(
+        source,
+        args=None,
+        cwd=None,
+        runas=None,
+        shell=DEFAULT_SHELL,
+        env='base',
+        template='jinja',
+        **kwargs):
+    '''
+    Download a script from a remote location and execute the script locally.
+    The script can be located on the salt master file server or on an http/ftp
+    server.
+
+    The script will be executed directly, so it can be written in any available
+    programming language.
+
+    The script can also be formated as a template, the default is jinja.
+    Arguments for the script can be specified as well.
+
+    CLI Example::
+
+        salt '*' cmd.script salt://scripts/runme.sh
+        salt '*' cmd.script salt://scripts/runme.sh 'arg1 arg2 "arg 3"'
+    '''
+    fd_, path = tempfile.mkstemp()
+    os.close(fd_)
+    if template:
+        __salt__['cp.get_template'](source, path, template, env, **kwargs)
+    else:
+        fn_ = __salt__['cp.cache_file'](source, env)
+        shutil.copyfile(fn_, path)
+    os.chmod(path, 320)
+    os.chown(path, __salt__['file.user_to_uid'](runas), -1)
+    ret = _run(
+            path +' '+ args if args else path,
+            cwd=cwd,
+            quiet=kwargs.get('quiet', False),
+            runas=runas,
+            shell=shell,
+            retcode=kwargs.get('retcode', False),
+            )
+    os.remove(path)
+    return ret
+
+
+def script_retcode(
+        source,
+        cwd=None,
+        runas=None,
+        shell=DEFAULT_SHELL,
+        env='base',
+        template='jinja',
+        **kwargs):
+    '''
+    Download a script from a remote location and execute the script locally.
+    The script can be located on the salt master file server or on an http/ftp
+    server.
+
+    The script will be executed directly, so it can be written in any available
+    programming language.
+
+    The script can also be formated as a template, the default is jinja.
+
+    Only evaluate the script return code and do not block for terminal output
+
+    CLI Example::
+
+        salt '*' cmd.script_retcode salt://scripts/runme.sh
+    '''
+    return script(
+            source,
+            cwd,
+            runas,
+            shell,
+            env,
+            template,
+            retcode=True,
+            **kwargs)['retcode']
 
 def which(cmd):
     '''

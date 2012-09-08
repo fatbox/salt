@@ -13,16 +13,14 @@ import logging
 import tempfile
 
 # Import Cryptography libs
-from Crypto.Cipher import AES
 from M2Crypto import RSA
-
-# Import zeromq libs
-import zmq
+from Crypto.Cipher import AES
 
 # Import salt utils
-import salt.payload
 import salt.utils
-from salt.exceptions import AuthenticationError, SaltClientError
+import salt.payload
+import salt.utils.verify
+from salt.exceptions import AuthenticationError, SaltClientError, SaltReqTimeoutError
 
 log = logging.getLogger(__name__)
 
@@ -67,7 +65,7 @@ def gen_keys(keydir, keyname, keysize):
     priv = '{0}.pem'.format(base)
     pub = '{0}.pub'.format(base)
 
-    gen = RSA.gen_key(keysize, 1)
+    gen = RSA.gen_key(keysize, 1, callback=lambda x,y,z:None)
     cumask = os.umask(191)
     gen.save_key(priv, None)
     os.umask(cumask)
@@ -98,7 +96,7 @@ class MasterKeys(dict):
                 key = RSA.load_key(self.rsa_path)
             except Exception:
                 # This is probably an "old key", we need to use m2crypto to
-                # open it and then save it back without a passphrase
+                # open it and then save it back without a pass phrase
                 key = clean_old_key(self.rsa_path)
 
             log.debug('Loaded master key: {0}'.format(self.rsa_path))
@@ -146,12 +144,16 @@ class Auth(object):
         Returns a key objects for the minion
         '''
         key = None
+        # Make sure all key parent directories are accessible
+        user = self.opts.get('user', 'root')
+        salt.utils.verify.check_parent_dirs(self.rsa_path, user)
+
         if os.path.exists(self.rsa_path):
             try:
                 key = RSA.load_key(self.rsa_path)
             except Exception:
                 # This is probably an "old key", we need to use m2crypto to
-                # open it and then save it back without a passphrase
+                # open it and then save it back without a pass phrase
                 key = clean_old_key(self.rsa_path)
             log.debug('Loaded minion key: {0}'.format(self.rsa_path))
         else:
@@ -234,16 +236,22 @@ class Auth(object):
         and the decrypted aes key for transport decryption.
         '''
         auth = {}
+        m_pub_fn = os.path.join(self.opts['pki_dir'], self.mpub)
         try:
-            self.opts['master_ip'] = salt.utils.dns_check(self.opts['master'], True)
+            self.opts['master_ip'] = salt.utils.dns_check(
+                    self.opts['master'],
+                    True
+                    )
         except SaltClientError:
             return 'retry'
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.connect(self.opts['master_uri'])
-        payload = self.serial.dumps(self.minion_sign_in_payload())
-        socket.send(payload)
-        payload = self.serial.loads(socket.recv())
+        sreq = salt.payload.SREQ(
+                self.opts['master_uri'],
+                self.opts.get('id', '')
+                )
+        try:
+            payload = sreq.send_auto(self.minion_sign_in_payload())
+        except SaltReqTimeoutError:
+            return 'retry'
         if 'load' in payload:
             if 'ret' in payload['load']:
                 if not payload['load']['ret']:
@@ -264,7 +272,6 @@ class Auth(object):
                     )
                     return 'retry'
         if not self.verify_master(payload['pub_key'], payload['token']):
-            m_pub_fn = os.path.join(self.opts['pki_dir'], self.mpub)
             log.critical(
                 'The Salt Master server\'s public key did not authenticate!\n'
                 'If you are confident that you are connecting to a valid Salt '
@@ -273,6 +280,20 @@ class Auth(object):
                 m_pub_fn
             )
             sys.exit(42)
+        if self.opts.get('master_finger', False):
+            if salt.utils.pem_finger(m_pub_fn) != self.opts['master_finger']:
+                log.critical((
+                    'The specified fingerprint in the master configuration '
+                    'file:\n{0}\nDoes not match the authenticating master\'s '
+                    'key:\n{1}\nVerify that the configured fingerprint '
+                    'matches the fingerprint of the correct master and that '
+                    'this minion is not subject to a man in the middle attack'
+                    ).format(
+                        self.opts['master_finger'],
+                        salt.utils.pem_finger(m_pub_fn)
+                        )
+                    )
+                sys.exit(42)
         auth['aes'] = self.decrypt_aes(payload['aes'])
         auth['publish_port'] = payload['publish_port']
         return auth

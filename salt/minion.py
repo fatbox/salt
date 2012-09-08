@@ -20,7 +20,7 @@ import zmq
 # Import salt libs
 from salt.exceptions import AuthenticationError, \
     CommandExecutionError, CommandNotFoundError, SaltInvocationError, \
-    SaltClientError
+    SaltClientError, SaltReqTimeoutError
 import salt.client
 import salt.crypt
 import salt.loader
@@ -109,7 +109,7 @@ class SMinion(object):
                 self.opts['environment'],
                 ).compile_pillar()
         self.functions = salt.loader.minion_mods(self.opts)
-        self.returners = salt.loader.returners(self.opts)
+        self.returners = salt.loader.returners(self.opts, self.functions)
         self.states = salt.loader.states(self.opts, self.functions)
         self.rend = salt.loader.render(self.opts, self.functions)
         self.matcher = Matcher(self.opts, self.functions)
@@ -132,9 +132,11 @@ class Minion(object):
         self.matcher = Matcher(self.opts, self.functions)
         self.proc_dir = get_proc_dir(opts['cachedir'])
         if hasattr(self, '_syndic') and self._syndic:
-            log.warn('Starting the Salt Syndic Minion')
+            log.warn(
+                'Starting the Salt Syndic Minion "{0}"'.format(self.opts['id'])
+            )
         else:
-            log.warn('Starting the Salt Minion')
+            log.warn('Starting the Salt Minion "{0}"'.format(self.opts['id']))
         self.authenticate()
         opts['pillar'] = salt.pillar.get_pillar(
             opts,
@@ -161,7 +163,7 @@ class Minion(object):
         '''
         self.opts['grains'] = salt.loader.grains(self.opts)
         functions = salt.loader.minion_mods(self.opts)
-        returners = salt.loader.returners(self.opts)
+        returners = salt.loader.returners(self.opts, functions)
         return functions, returners
 
     def _handle_payload(self, payload):
@@ -275,10 +277,12 @@ class Minion(object):
 
         function_name = data['fun']
         if function_name in self.functions:
+            ret['success'] = False
             try:
                 func = self.functions[data['fun']]
                 args, kw = detect_kwargs(func, data['arg'], data)
                 ret['return'] = func(*args, **kw)
+                ret['success'] = True
             except CommandNotFoundError as exc:
                 msg = 'Command required for \'{0}\' not found: {1}'
                 log.debug(msg.format(function_name, str(exc)))
@@ -334,10 +338,12 @@ class Minion(object):
                 except Exception:
                     pass
 
+            ret['success'][data['fun'][ind]] = False
             try:
                 func = self.functions[data['fun'][ind]]
                 args, kw = detect_kwargs(func, data['arg'][ind], data)
                 ret['return'][data['fun'][ind]] = func(*args, **kw)
+                ret['success'][data['fun'][ind]] = True
             except Exception as exc:
                 trb = traceback.format_exc()
                 log.warning(
@@ -374,10 +380,7 @@ class Minion(object):
                     # The file is gone already
                     pass
         log.info('Returning information for job: {0}'.format(ret['jid']))
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.connect(self.opts['master_uri'])
-        payload = {'enc': 'aes'}
+        sreq = salt.payload.SREQ(self.opts['master_uri'])
         if ret_cmd == '_syndic_return':
             load = {'cmd': ret_cmd,
                     'jid': ret['jid'],
@@ -399,17 +402,14 @@ class Minion(object):
                     load['out'] = oput
         except KeyError:
             pass
-        payload['load'] = self.crypticle.dumps(load)
-        data = self.serial.dumps(payload)
-        socket.send(data)
-        ret_val = self.serial.loads(socket.recv())
+        try:
+            ret_val = sreq.send('aes', self.crypticle.dumps(load))
+        except SaltReqTimeoutError:
+            ret_val = ''
         if isinstance(ret_val, string_types) and not ret_val:
             # The master AES key has changed, reauth
             self.authenticate()
-            payload['load'] = self.crypticle.dumps(load)
-            data = self.serial.dumps(payload)
-            socket.send(data)
-            ret_val = self.serial.loads(socket.recv())
+            ret_val = sreq.send('aes', self.crypticle.dumps(load))
         if self.opts['cache_jobs']:
             # Local job cache has been enabled
             fn_ = os.path.join(
@@ -435,7 +435,9 @@ class Minion(object):
         in, signing in can occur as often as needed to keep up with the
         revolving master aes key.
         '''
-        log.debug('Attempting to authenticate with the Salt Master')
+        log.debug('Attempting to authenticate with the Salt Master at {0}'.format(
+            self.opts['master_ip']
+        ))
         auth = salt.crypt.Auth(self.opts)
         while True:
             creds = auth.sign_in()
@@ -474,14 +476,68 @@ class Minion(object):
         '''
         Lock onto the publisher. This is the main event loop for the minion
         '''
+        log.debug('Minion "{0}" trying to  tune in'.format(self.opts['id']))
         context = zmq.Context()
+
+        # Prepare the minion event system
+        #
+        # Start with the publish socket
+        epub_sock_path = os.path.join(
+                self.opts['sock_dir'],
+                'minion_event_{0}_pub.ipc'.format(self.opts['id'])
+                )
+        epull_sock_path = os.path.join(
+                self.opts['sock_dir'],
+                'minion_event_{0}_pull.ipc'.format(self.opts['id'])
+                )
+        epub_sock = context.socket(zmq.PUB)
+        if self.opts.get('ipc_mode', '') == 'tcp':
+            epub_uri = 'tcp://127.0.0.1:{0}'.format(
+                    self.opts['tcp_pub_port']
+                    )
+            epull_uri = 'tcp://127.0.0.1:{0}'.format(
+                    self.opts['tcp_pull_port']
+                    )
+        else:
+            epub_uri = 'ipc://{0}'.format(epub_sock_path)
+            epull_uri = 'ipc://{0}'.format(epull_sock_path)
+
+        log.debug(
+            '{0} PUB socket URI: {1}'.format(
+                self.__class__.__name__, epub_uri
+            )
+        )
+        log.debug(
+            '{0} PULL socket URI: {1}'.format(
+                self.__class__.__name__, epull_uri
+            )
+        )
+
+        # Create the pull socket
+        epull_sock = context.socket(zmq.PULL)
+        # Bind the event sockets
+        epub_sock.bind(epub_uri)
+        epull_sock.bind(epull_uri)
+        # Restrict access to the sockets
+        if not self.opts.get('ipc_mode', '') == 'tcp':
+            os.chmod(
+                    epub_sock_path,
+                    448
+                    )
+            os.chmod(
+                    epull_sock_path,
+                    448
+                    )
+
         poller = zmq.Poller()
+        epoller = zmq.Poller()
         socket = context.socket(zmq.SUB)
         socket.setsockopt(zmq.SUBSCRIBE, '')
         if self.opts['sub_timeout']:
             socket.setsockopt(zmq.IDENTITY, self.opts['id'])
         socket.connect(self.master_pub)
         poller.register(socket, zmq.POLLIN)
+        epoller.register(epull_sock, zmq.POLLIN)
 
         # Make sure to gracefully handle SIGUSR1
         enable_sigusr1_handler()
@@ -489,43 +545,63 @@ class Minion(object):
         if self.opts['sub_timeout']:
             last = time.time()
             while True:
-                socks = dict(poller.poll(self.opts['sub_timeout']))
-                if socket in socks and socks[socket] == zmq.POLLIN:
-                    payload = self.serial.loads(socket.recv())
-                    self._handle_payload(payload)
-                    last = time.time()
-                if time.time() - last > self.opts['sub_timeout']:
-                    # It has been a while since the last command, make sure
-                    # the connection is fresh by reconnecting
-                    if self.opts['dns_check']:
+                try:
+                    socks = dict(poller.poll(self.opts['sub_timeout']))
+                    if socket in socks and socks[socket] == zmq.POLLIN:
+                        payload = self.serial.loads(socket.recv())
+                        self._handle_payload(payload)
+                        last = time.time()
+                    if time.time() - last > self.opts['sub_timeout']:
+                        # It has been a while since the last command, make sure
+                        # the connection is fresh by reconnecting
+                        if self.opts['dns_check']:
+                            try:
+                                # Verify that the dns entry has not changed
+                                self.opts['master_ip'] = salt.utils.dns_check(
+                                    self.opts['master'], safe=True)
+                            except SaltClientError:
+                                # Failed to update the dns, keep the old addr
+                                pass
+                        poller.unregister(socket)
+                        socket.close()
+                        socket = context.socket(zmq.SUB)
+                        socket.setsockopt(zmq.SUBSCRIBE, '')
+                        socket.setsockopt(zmq.IDENTITY, self.opts['id'])
+                        socket.connect(self.master_pub)
+                        poller.register(socket, zmq.POLLIN)
+                        last = time.time()
+                    time.sleep(0.05)
+                    multiprocessing.active_children()
+                    self.passive_refresh()
+                    # Check the event system
+                    if epoller.poll(1):
                         try:
-                            # Verify that the dns entry has not changed
-                            self.opts['master_ip'] = salt.utils.dns_check(
-                                self.opts['master'], safe=True)
-                        except SaltClientError:
-                            # Failed to update the dns, keep the old addr
+                            package = epull_sock.recv(zmq.NOBLOCK)
+                            epub_sock.send(package)
+                        except Exception:
                             pass
-                    poller.unregister(socket)
-                    socket.close()
-                    socket = context.socket(zmq.SUB)
-                    socket.setsockopt(zmq.SUBSCRIBE, '')
-                    socket.setsockopt(zmq.IDENTITY, self.opts['id'])
-                    socket.connect(self.master_pub)
-                    poller.register(socket, zmq.POLLIN)
-                    last = time.time()
-                time.sleep(0.05)
-                multiprocessing.active_children()
-                self.passive_refresh()
+                except Exception as exc:
+                    log.critical(traceback.format_exc())
         else:
             while True:
-                socks = dict(poller.poll(60))
-                if socket in socks and socks[socket] == zmq.POLLIN:
-                    payload = self.serial.loads(socket.recv())
-                    self._handle_payload(payload)
-                    last = time.time()
-                time.sleep(0.05)
-                multiprocessing.active_children()
-                self.passive_refresh()
+                try:
+                    socks = dict(poller.poll(60))
+                    if socket in socks and socks[socket] == zmq.POLLIN:
+                        payload = self.serial.loads(socket.recv())
+                        self._handle_payload(payload)
+                        last = time.time()
+                    time.sleep(0.05)
+                    multiprocessing.active_children()
+                    self.passive_refresh()
+                    # Check the event system
+                    if epoller.poll(1):
+                        try:
+                            package = epull_sock.recv(zmq.NOBLOCK)
+                            epub_sock.send(package)
+                        except Exception:
+                            pass
+                except Exception:
+                    log.critical(traceback.format_exc())
 
 
 class Syndic(salt.client.LocalClient, Minion):

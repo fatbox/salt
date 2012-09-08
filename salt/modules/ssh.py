@@ -188,7 +188,6 @@ def auth_keys(user, config='.ssh/authorized_keys'):
 
         salt '*' ssh.auth_keys root
     '''
-    ret = {}
     uinfo = __salt__['user.info'](user)
     full = os.path.join(uinfo['home'], config)
     if not os.path.isfile(full):
@@ -270,19 +269,12 @@ def rm_auth_key(user, key, config='.ssh/authorized_keys'):
                 # not an auth ssh key, perhaps a blank line
                 continue
 
-            opts = ln.group(1)
             comps = ln.group(2).split()
 
             if len(comps) < 2:
                 # Not a valid line
                 lines.append(line)
                 continue
-
-            if opts:
-                # It has options, grab them
-                options = opts.split(',')
-            else:
-                options = []
 
             pkey = comps[1]
 
@@ -349,8 +341,7 @@ def set_auth_key(
 
     CLI Example::
 
-        salt '*' ssh.set_auth_key <user> key='<key>' enc='dsa'\
-                comment='my key' options='[]' config='.ssh/authorized_keys'
+        salt '*' ssh.set_auth_key <user> '<key>' enc='dsa'
     '''
     if len(key.split()) > 1:
         return 'invalid'
@@ -381,12 +372,14 @@ def set_auth_key(
         if not os.path.isdir(os.path.dirname(fconfig)):
             dpath = os.path.dirname(fconfig)
             os.makedirs(dpath)
-            os.chown(dpath, uinfo['uid'], uinfo['gid'])
+            if os.geteuid() == 0:
+                os.chown(dpath, uinfo['uid'], uinfo['gid'])
             os.chmod(dpath, 448)
 
         if not os.path.isfile(fconfig):
             open(fconfig, 'a+').write('{0}'.format(auth_line))
-            os.chown(fconfig, uinfo['uid'], uinfo['gid'])
+            if os.geteuid() == 0:
+                os.chown(fconfig, uinfo['uid'], uinfo['gid'])
             os.chmod(fconfig, 384)
         else:
             open(fconfig, 'a+').write('{0}'.format(auth_line))
@@ -549,6 +542,8 @@ def set_known_host(user, hostname,
     line = '{hostname} {enc} {key}\n'.format(**remote_host)
     with open(full, 'a') as fd:
         fd.write(line)
+    if os.geteuid() == 0:
+        os.chown(full, uinfo['uid'], uinfo['gid'])
     return {'status': 'updated', 'old': stored_host, 'new': remote_host}
 
     status = check_known_host(user, hostname, fingerprint=fingerprint,

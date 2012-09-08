@@ -17,7 +17,7 @@ def __virtual__():
     return 'pkg' if __grains__['os'] in ('Debian', 'Ubuntu') else False
 
 
-def __init__():
+def __init__(opts):
     '''
     For Debian and derivative systems, set up
     a few env variables to keep apt happy and
@@ -43,11 +43,12 @@ def available_version(name):
         salt '*' pkg.available_version <package name>
     '''
     version = ''
-    cmd = 'apt-cache -q show {0} | grep ^Version'.format(name)
+    cmd = 'apt-cache -q policy {0} | grep Candidate'.format(name)
 
     out = __salt__['cmd.run_stdout'](cmd)
 
     version_list = out.split()
+
     if len(version_list) >= 2:
         version = version_list[-1]
 
@@ -306,7 +307,7 @@ def _get_upgradable():
     { 'pkgname': '1.2.3-45', ... }
     '''
 
-    cmd = 'apt-get --just-print upgrade'
+    cmd = 'apt-get --just-print dist-upgrade'
     out = __salt__['cmd.run_stdout'](cmd)
 
     # rexp parses lines that look like the following:
@@ -314,8 +315,8 @@ def _get_upgradable():
     rexp = re.compile('(?m)^Conf '
                       '([^ ]+) ' # Package name
                       '\(([^ ]+) ' # Version
-                      '([^ ]+) ' # Release
-                      '\[([^\]]+)\]\)$') # Arch
+                      '([^ ]+)' # Release
+                      '(?: \[([^\]]+)\])?\)$') # Arch
     keys = ['name', 'version', 'release', 'arch']
     _get = lambda l, k: l[keys.index(k)]
 

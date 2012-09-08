@@ -9,14 +9,18 @@ Routines to set up a minion
 # Import python libs
 import os
 import imp
+import sys
 import salt
 import logging
 import tempfile
+import traceback
+
+# Import Salt libs
 from salt.exceptions import LoaderError
 
 log = logging.getLogger(__name__)
 salt_base_path = os.path.dirname(salt.__file__)
-
+loaded_base_name = 'salt.loaded'
 
 def _create_loader(opts, ext_type, tag, ext_dirs=True, ext_type_dirs=None):
     '''
@@ -38,6 +42,7 @@ def _create_loader(opts, ext_type, tag, ext_dirs=True, ext_type_dirs=None):
             ext_type_types.extend(opts[ext_type_dirs])
 
     module_dirs = ext_type_types + [ext_types, sys_types]
+    generate_module('{0}.{1}'.format(loaded_base_name, tag))
     return Loader(module_dirs, opts, tag)
 
 
@@ -50,15 +55,10 @@ def minion_mods(opts):
     if opts.get('providers', False):
         if isinstance(opts['providers'], dict):
             for mod, provider in opts['providers'].items():
-                funcs = raw_mod(opts,
-                        provider,
-                        functions)
+                funcs = raw_mod(opts, provider, functions)
                 if funcs:
                     for func in funcs:
-                        f_key = '{0}{1}'.format(
-                                mod,
-                                func[func.rindex('.'):]
-                                )
+                        f_key = '{0}{1}'.format(mod, func[func.rindex('.'):])
                         functions[f_key] = funcs[func]
     return functions
 
@@ -71,12 +71,24 @@ def raw_mod(opts, name, functions):
     return load.gen_module(name, functions)
 
 
-def returners(opts):
+def returners(opts, functions):
     '''
     Returns the returner modules
     '''
     load = _create_loader(opts, 'returners', 'returner')
-    return load.filter_func('returner')
+    pack = {'name': '__salt__',
+            'value': functions}
+    return load.filter_func('returner', pack)
+
+
+def pillars(opts, functions):
+    '''
+    Returns the returner modules
+    '''
+    load = _create_loader(opts, 'pillar', 'pillar')
+    pack = {'name': '__salt__',
+            'value': functions}
+    return load.filter_func('ext_pillar', pack)
 
 
 def states(opts, functions):
@@ -113,19 +125,21 @@ def grains(opts):
     if not 'grains' in opts:
         pre_opts = {}
         salt.config.load_config(
-                pre_opts,
-                opts['conf_file'],
-                'SALT_MINION_CONFIG'
-                )
-        if 'include' in pre_opts:
-            pre_opts = salt.config.include_config(
-                    pre_opts,
-                    opts['conf_file']
-                    )
+            pre_opts, opts['conf_file'], 'SALT_MINION_CONFIG'
+        )
+        default_include = pre_opts.get('default_include', [])
+        include = pre_opts.get('include', [])
+        pre_opts = salt.config.include_config(
+            default_include, pre_opts, opts['conf_file'], verbose=False
+        )
+        pre_opts = salt.config.include_config(
+            include, pre_opts, opts['conf_file'], verbose=True
+        )
         if 'grains' in pre_opts:
             opts['grains'] = pre_opts['grains']
         else:
             opts['grains'] = {}
+
     load = _create_loader(opts, 'grains', 'grain', ext_dirs=False)
     grains = load.gen_grains()
     grains.update(opts['grains'])
@@ -138,9 +152,7 @@ def call(fun, **kwargs):
     '''
     args = kwargs.get('args', [])
     dirs = kwargs.get('dirs', [])
-    module_dirs = [
-        os.path.join(salt_base_path, 'modules'),
-        ] + dirs
+    module_dirs = [os.path.join(salt_base_path, 'modules')] + dirs
     load = Loader(module_dirs)
     return load.call(fun, args)
 
@@ -150,13 +162,18 @@ def runner(opts):
     Directly call a function inside a loader directory
     '''
     load = _create_loader(
-            opts,
-            'runners',
-            'runner',
-            ext_type_dirs='runner_dirs'
-            )
+        opts, 'runners', 'runner', ext_type_dirs='runner_dirs'
+    )
     return load.gen_functions()
 
+def generate_module(name):
+    if name in sys.modules:
+        return
+
+    code = """'''Salt loaded {0} parent module'''""".format(name.split('.')[-1])
+    module = imp.new_module(name)
+    exec code in module.__dict__
+    sys.modules[name] = module
 
 class Loader(object):
     '''
@@ -242,10 +259,13 @@ class Loader(object):
             if not os.path.isdir(mod_dir):
                 continue
             fn_ = os.path.join(mod_dir, name)
-            for ext in ('.py', '.pyo', '.pyc', '.so'):
-                full_test = '{0}{1}'.format(fn_, ext)
-                if os.path.isfile(full_test):
-                    full = full_test
+            if os.path.isdir(fn_):
+                full = fn_
+            else:
+                for ext in ('.py', '.pyo', '.pyc', '.so'):
+                    full_test = '{0}{1}'.format(fn_, ext)
+                    if os.path.isfile(full_test):
+                        full = full_test
         if not full:
             return None
         cython_enabled = False
@@ -258,24 +278,23 @@ class Loader(object):
                 log.info('Cython is enabled in the options but not present '
                          'in the system path. Skipping Cython modules.')
         try:
-            if full.endswith('.pyx'):
+            if full.endswith('.pyx') and cython_enabled:
                 # If there's a name which ends in .pyx it means the above
                 # cython_enabled is True. Continue...
                 mod = pyximport.load_module(name, full, tempfile.gettempdir())
             else:
                 fn_, path, desc = imp.find_module(name, self.module_dirs)
                 mod = imp.load_module(
-                        '{0}_{1}'.format(name, self.tag),
-                        fn_,
-                        path,
-                        desc
-                        )
+                    '{0}.{1}.{2}'.format(loaded_base_name, self.tag, name),
+                    fn_, path, desc
+                )
         except ImportError as exc:
             log.debug(('Failed to import module {0}: {1}').format(name, exc))
             return mod
         except Exception as exc:
+            trb = traceback.format_exc()
             log.warning(('Failed to import module {0}, this is due most'
-                ' likely to a syntax error: {1}').format(name, exc))
+                ' likely to a syntax error: {1}').format(name, trb))
             return mod
         if hasattr(mod, '__opts__'):
             mod.__opts__.update(self.opts)
@@ -295,7 +314,7 @@ class Loader(object):
         if hasattr(mod, '__init__'):
             if callable(mod.__init__):
                 try:
-                    mod.__init__()
+                    mod.__init__(self.opts)
                 except TypeError:
                     pass
         funcs = {}
@@ -308,11 +327,12 @@ class Loader(object):
                     if 'BaseException' in func.__bases__:
                         # the callable object is an exception, don't load it
                         continue
+
                 funcs[
-                        '{0}.{1}'.format(
-                            mod.__name__[:mod.__name__.rindex('_')],
-                            attr)
-                        ] = func
+                    '{0}.{1}'.format(
+                        mod.__name__[mod.__name__.rindex('.')+1:], attr
+                    )
+                ] = func
                 self._apply_outputter(func, mod)
         if not hasattr(mod, '__salt__'):
             mod.__salt__ = functions
@@ -347,32 +367,54 @@ class Loader(object):
                 if fn_.split('.')[0] in disable:
                     continue
                 if (fn_.endswith(('.py', '.pyc', '.pyo', '.so'))
-                    or (cython_enabled and fn_.endswith('.pyx'))):
-                    names[fn_[:fn_.rindex('.')]] = os.path.join(mod_dir, fn_)
+                    or (cython_enabled and fn_.endswith('.pyx'))
+                    or os.path.isdir( os.path.join(mod_dir,fn_) )):
+
+                    extpos = fn_.rfind('.')
+                    if extpos > 0:
+                        _name = fn_[:extpos]
+                    else:
+                        _name = fn_
+                    names[_name] = os.path.join(mod_dir, fn_)
         for name in names:
             try:
                 if names[name].endswith('.pyx'):
                     # If there's a name which ends in .pyx it means the above
                     # cython_enabled is True. Continue...
                     mod = pyximport.load_module(
-                            '{0}_{1}'.format(name, self.tag),
-                            names[name],
-                            tempfile.gettempdir())
+                        '{0}.{1}.{2}'.format(loaded_base_name, self.tag, name),
+                        names[name], tempfile.gettempdir()
+                    )
                 else:
                     fn_, path, desc = imp.find_module(name, self.module_dirs)
                     mod = imp.load_module(
-                            '{0}_{1}'.format(name, self.tag),
-                            fn_,
-                            path,
-                            desc
-                            )
+                        '{0}.{1}.{2}'.format(loaded_base_name, self.tag, name),
+                        fn_, path, desc
+                    )
+                    # reload all submodules if necessary
+                    submodules = [
+                        getattr(mod,sname) for sname in dir(mod) if
+                        type(getattr(mod,sname))==type(mod)
+                    ]
+                    # reload only custom "sub"modules i.e is a submodule in
+                    # parent module that are still available on disk (i.e. not
+                    # removed during sync_modules)
+                    for submodule in submodules:
+                        try:
+                            smname = '{0}.{1}.{2}'.format(loaded_base_name, self.tag, name)
+                            smfile = os.path.splitext(submodule.__file__)[0] + ".py"
+                            if submodule.__name__.startswith(smname) and os.path.isfile(smfile):
+                                reload(submodule)
+                        except AttributeError:
+                            continue
             except ImportError as exc:
                 log.debug(('Failed to import module {0}, this is most likely'
                            ' NOT a problem: {1}').format(name, exc))
                 continue
             except Exception as exc:
+                trb = traceback.format_exc()
                 log.warning(('Failed to import module {0}, this is due most'
-                    ' likely to a syntax error: {1}').format(name, exc))
+                    ' likely to a syntax error: {1}').format(name, trb))
                 continue
             modules.append(mod)
         for mod in modules:
@@ -396,7 +438,7 @@ class Loader(object):
             if hasattr(mod, '__init__'):
                 if callable(mod.__init__):
                     try:
-                        mod.__init__()
+                        mod.__init__(self.opts)
                     except TypeError:
                         pass
 
@@ -422,10 +464,11 @@ class Loader(object):
                         pass
                     else:
                         funcs[
-                                '{0}.{1}'.format(
-                                    mod.__name__[:mod.__name__.rindex('_')],
-                                    attr)
-                                ] = func
+                            '{0}.{1}'.format(
+                                mod.__name__[mod.__name__.rindex('.')+1:],
+                                attr
+                            )
+                        ] = func
                         self._apply_outputter(func, mod)
         for mod in modules:
             if not hasattr(mod, '__salt__'):
@@ -512,10 +555,11 @@ class Loader(object):
                 continue
             try:
                 ret = fun()
-            except Exception as exc:
+            except Exception:
+                trb = traceback.format_exc()
                 log.critical(('Failed to load grains defined in grain file '
-                              '{0} in function {1}, error: {2}').format(
-                                  key, fun, exc))
+                              '{0} in function {1}, error:\n{2}').format(
+                                  key, fun, trb))
                 continue
             if not isinstance(ret, dict):
                 continue

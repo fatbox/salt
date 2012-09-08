@@ -21,10 +21,58 @@ class Key(object):
     '''
     def __init__(self, opts):
         self.opts = opts
-        self.event = salt.utils.event.SaltEvent(opts['sock_dir'], 'master')
+        self.event = salt.utils.event.MasterEvent(opts['sock_dir'])
         self.colors = salt.utils.get_colors(
                 not bool(self.opts.get('no_color', False))
                 )
+        if not opts.get('gen_keys', None):
+            # Only check for a master running IF we need it.
+            # While generating keys we don't
+            self._check_master()
+
+    def _check_master(self):
+        '''
+        Log if the master is not running
+        '''
+        if not os.path.exists(
+                os.path.join(
+                    self.opts['sock_dir'],
+                    'publish_pull.ipc'
+                    )
+                ):
+            self._log('Master is not running', level='error')
+
+
+    def _cli_opts(self, **kwargs):
+        '''
+        Set the default cli opts to use when calling salt-key as an api. All
+        options can be passed in a kwargs to override defaults.
+        '''
+        opts = {
+                'list': '',
+                'list_all': False,
+                'accept': '',
+                'accept_all': False,
+                'reject': '',
+                'reject_all': False,
+                'print': '',
+                'print_all': False,
+                'delete': '',
+                'delete_all': False,
+                'finger': '',
+                'quiet': False,
+                'yes': True,
+                'gen_keys': '',
+                'gen_keys_dir': '.',
+                'keysize': 2048,
+                'conf_file': '/etc/salt/master',
+                'raw_out': False,
+                'yaml_out': False,
+                'json_out': False,
+                'no_color': False,
+                }
+        opts.update(kwargs)
+        self.opts.update(opts)
 
     def _keys(self, key_type, full_path=False):
         '''
@@ -57,7 +105,7 @@ class Key(object):
         if hasattr(log, level):
             log_msg = getattr(log, level)
             log_msg(message)
-        if not self.opts['quiet']:
+        if not self.opts.get('quiet', False):
             print(message)
 
     def _list_pre(self, header=True, printer=None):
@@ -118,9 +166,11 @@ class Key(object):
         '''
         List keys
         '''
-        printout = self._get_outputter()
-        if 'json_out' in self.opts and self.opts['json_out']:
-            printout.indent = 2
+        selected_output = self.opts.get('selected_output_option', None)
+        printout = salt.output.get_printout(
+            {}, selected_output, self.opts, indent=2
+        )
+
         if name in ('pre', 'un', 'unaccept', 'unaccepted'):
             self._list_pre(header=False, printer=printout)
         elif name in ('acc', 'accept', 'accepted'):
@@ -143,18 +193,6 @@ class Key(object):
             err = ('Unrecognized key type "{0}".  Run with -h for options.'
                     ).format(name)
             self._log(err, level='error')
-
-    def _get_outputter(self):
-        get_outputter = salt.output.get_outputter
-        if self.opts['raw_out']:
-            printout = get_outputter('raw')
-        elif self.opts['json_out']:
-            printout = get_outputter('json')
-        elif self.opts['yaml_out']:
-            printout = get_outputter('yaml')
-        else:
-            printout = None # use default color output
-        return printout
 
     def _print_key(self, name):
         '''
@@ -242,34 +280,76 @@ class Key(object):
         '''
         Delete a key
         '''
+        # Don't ask for verification if yes is not set
+        yes = self.opts.get('yes', True)
         (minions_accepted,
          minions_pre,
          minions_rejected) = self._check_minions_directories()
         if delete is None:
             delete = self.opts['delete']
+        else:
+            # If a key is explicitly passed then don't ask for verification
+            yes = True
         pre = os.path.join(minions_pre, delete)
         acc = os.path.join(minions_accepted, delete)
         rej = os.path.join(minions_rejected, delete)
         if os.path.exists(pre):
-            os.remove(pre)
-            self._log('Removed pending key {0}'.format(delete),
-                         level='info')
+            rm_ = True
+            if not yes:
+                msg = ('The following pending key is set to be removed: {0}'
+                       '\n[n/Y]').format(delete)
+                veri = raw_input(msg)
+                # Default to Yes
+                if veri.lower().startswith('n'):
+                    rm_ = False
+            if rm_:
+                os.remove(pre)
+                self._log('Removed pending key {0}'.format(delete),
+                             level='info')
         if os.path.exists(acc):
-            os.remove(acc)
-            self._log('Removed accepted key {0}'.format(delete),
-                         level='info')
+            rm_ = True
+            if not yes:
+                msg = ('The following accepted key is set to be removed: {0}'
+                       '\n[n/Y]').format(delete)
+                veri = raw_input(msg)
+                # Default to Yes
+                if veri.lower().startswith('n'):
+                    rm_ = False
+            if rm_:
+                os.remove(acc)
+                self._log('Removed accepted key {0}'.format(delete),
+                             level='info')
         if os.path.exists(rej):
-            os.remove(rej)
-            self._log('Removed rejected key {0}'.format(delete),
-                         level='info')
+            rm_ = True
+            if not yes:
+                msg = ('The following rejected key is set to be removed: {0}'
+                       '\n[n/Y]').format(delete)
+                veri = raw_input(msg)
+                # Default to Yes
+                if veri.lower().startswith('n'):
+                    rm_ = False
+            if rm_:
+                os.remove(rej)
+                self._log('Removed rejected key {0}'.format(delete),
+                             level='info')
 
     def _delete_all(self):
         '''
         Delete all keys
         '''
+        # Don't ask for verification if yes is not set
+        del_ = set()
         for dir in ("acc", "rej", "pre"):
             for key in self._keys(dir):
-                self._delete_key(key)
+                del_.add(key)
+        msg = 'The following keys are going to be deleted:\n'
+        for key in sorted(del_):
+            msg += '{0}\n'.format(key)
+        veri = raw_input('{0}[n/Y]'.format(msg))
+        if veri.lower().startswith('n'):
+            return
+        for key in del_:
+            self._delete_key(key)
 
     def _reject(self, key):
         '''
@@ -299,6 +379,9 @@ class Key(object):
             self._reject(key)
 
     def _check_minions_directories(self):
+        '''
+        Return the minion keys directory paths
+        '''
         minions_accepted = os.path.join(self.opts['pki_dir'], 'minions')
         minions_pre = os.path.join(self.opts['pki_dir'], 'minions_pre')
         minions_rejected = os.path.join(self.opts['pki_dir'],
@@ -311,6 +394,32 @@ class Key(object):
                 sys.exit(42)
         return minions_accepted, minions_pre, minions_rejected
 
+    def finger(self):
+        '''
+        Return the fingerprint for a specified key
+        '''
+        fkey = self.opts.get('finger', 'master')
+        dirs = list(self._check_minions_directories())
+        dirs.append(self.opts['pki_dir'])
+        sigs = {}
+        for dir_ in dirs:
+            pub = os.path.join(dir_, '{0}.pub'.format(fkey))
+            fin = salt.utils.pem_finger(pub)
+            if fin:
+                self._log('Signature for {0} public key: {1}'.format(fkey, fin))
+                sigs['{0}.pub'.format(fkey)] = fin
+            pub = os.path.join(dir_, '{0}'.format(fkey))
+            fin = salt.utils.pem_finger(pub)
+            if fin:
+                self._log('Signature for {0} public key: {1}'.format(fkey, fin))
+                sigs['{0}.pub'.format(fkey)] = fin
+            pri = os.path.join(dir_, '{0}.pub'.format(fkey))
+            fin = salt.utils.pem_finger(pri)
+            if fin:
+                self._log('Signature for {0} private key: {1}'.format(fkey, fin))
+                sigs['{0}.pem'.format(fkey)] = fin
+        return sigs
+
     def run(self):
         '''
         Run the logic for saltkey
@@ -320,6 +429,7 @@ class Key(object):
                     self.opts['gen_keys_dir'],
                     self.opts['gen_keys'],
                     self.opts['keysize'])
+            self._log('Keys generation complete', level='info')
             return
         if self.opts['list']:
             self._list(self.opts['list'])
@@ -341,5 +451,7 @@ class Key(object):
             self._delete_key()
         elif self.opts['delete_all']:
             self._delete_all()
+        elif self.opts['finger']:
+            self.finger()
         else:
             self._list('all')

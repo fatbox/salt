@@ -12,15 +12,15 @@ import subprocess
 
 # Import third-party libs
 import yaml
-import zmq
 
 # Import salt libs
-from salt.exceptions import MinionError
+from salt.exceptions import MinionError, SaltReqTimeoutError
 import salt.client
 import salt.crypt
 import salt.loader
 import salt.utils
 import salt.payload
+import salt.utils
 import salt.utils.templates
 from salt._compat import (
     URLError, HTTPError, BaseHTTPServer, urlparse, url_open)
@@ -69,7 +69,7 @@ class Client(object):
 
         filelist = []
 
-        for root, dirs, files in os.walk(destdir):
+        for root, dirs, files in os.walk(destdir, followlinks=True):
             for name in files:
                 path = os.path.join(root, name)
                 filelist.append(path)
@@ -148,19 +148,19 @@ class Client(object):
         if include_empty:
             # Break up the path into a list containing the bottom-level directory
             # (the one being recursively copied) and the directories preceding it
-            separated = string.rsplit(path,'/',1)
-            if len(separated) != 2:
-                # No slashes in path. (This means all files in env will be copied)
-                prefix = ''
-            else:
-                prefix = separated[0]
+            #separated = string.rsplit(path, '/', 1)
+            #if len(separated) != 2:
+            #    # No slashes in path. (This means all files in env will be copied)
+            #    prefix = ''
+            #else:
+            #    prefix = separated[0]
             for fn_ in self.file_list_emptydirs(env):
                 if fn_.startswith(path):
-                    dest = os.path.normpath(
-                      os.sep.join([
-                      self.opts['cachedir'],
-                      'files',
-                      env])) 
+                    dest = salt.utils.path_join(
+                        self.opts['cachedir'],
+                        'files',
+                        env
+                    )
                     minion_dir = '%s/%s' % (dest,fn_)
                     if not os.path.isdir(minion_dir):
                         os.makedirs(minion_dir)
@@ -296,13 +296,13 @@ class Client(object):
                 else:
                     return ''
         else:
-            dest = os.path.normpath(
-                os.sep.join([
-                    self.opts['cachedir'],
-                    'extrn_files',
-                    env,
-                    url_data.netloc,
-                    url_data.path]))
+            dest = salt.utils.path_join(
+                self.opts['cachedir'],
+                'extrn_files',
+                env,
+                url_data.netloc,
+                url_data.path
+            )
             destdir = os.path.dirname(dest)
             if not os.path.isdir(destdir):
                 os.makedirs(destdir)
@@ -354,13 +354,13 @@ class Client(object):
             return ''
         if not dest:
             # No destination passed, set the dest as an extrn_files cache
-            dest = os.path.normpath(
-                os.sep.join([
-                    self.opts['cachedir'],
-                    'extrn_files',
-                    env,
-                    url_data.netloc,
-                    url_data.path]))
+            dest = salt.utils.path_join(
+                self.opts['cachedir'],
+                'extrn_files',
+                env,
+                url_data.netloc,
+                url_data.path
+            )
         destdir = os.path.dirname(dest)
         if not os.path.isdir(destdir):
             if makedirs:
@@ -397,23 +397,13 @@ class LocalClient(Client):
 
     def get_file(self, path, dest='', makedirs=False, env='base'):
         '''
-        Copies a file from the local files directory and coppies it into place
+        Copies a file from the local files directory into :param:`dest`
         '''
         path = self._check_proto(path)
         fnd = self._find_file(path, env)
         if not fnd['path']:
             return ''
-        if not dest:
-            with self._cache_loc(path, env) as cache_dest:
-                dest = cache_dest
-        destdir = os.path.dirname(dest)
-        if not os.path.isdir(destdir):
-            if makedirs:
-                os.makedirs(destdir)
-            else:
-                return False
-        shutil.copy(fnd['path'], dest)
-        return dest
+        return fnd['path']
 
     def file_list(self, env='base'):
         '''
@@ -423,7 +413,7 @@ class LocalClient(Client):
         if env not in self.opts['file_roots']:
             return ret
         for path in self.opts['file_roots'][env]:
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(path, followlinks=True):
                 for fn in files:
                     ret.append(
                         os.path.relpath(
@@ -444,7 +434,7 @@ class LocalClient(Client):
         if env not in self.opts['file_roots']:
             return ret
         for path in self.opts['file_roots'][env]:
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(path, followlinks=True):
                 if len(dirs) == 0 and len(files) == 0:
                     ret.append(os.path.relpath(root, path))
         return ret
@@ -533,16 +523,7 @@ class RemoteClient(Client):
     def __init__(self, opts):
         Client.__init__(self, opts)
         self.auth = salt.crypt.SAuth(opts)
-        self.socket = self.__get_socket()
-
-    def __get_socket(self):
-        '''
-        Return the ZeroMQ socket to use
-        '''
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.connect(self.opts['master_uri'])
-        return socket
+        self.sreq = salt.payload.SREQ(self.opts['master_uri'])
 
     def get_file(self, path, dest='', makedirs=False, env='base'):
         '''
@@ -552,7 +533,6 @@ class RemoteClient(Client):
         cache
         '''
         path = self._check_proto(path)
-        payload = {'enc': 'aes'}
         load = {'path': path,
                 'env': env,
                 'cmd': '_serve_file'}
@@ -564,28 +544,35 @@ class RemoteClient(Client):
                     os.makedirs(destdir)
                 else:
                     return False
-            fn_ = open(dest, 'w+')
+            fn_ = open(dest, 'wb+')
         while True:
             if not fn_:
                 load['loc'] = 0
             else:
                 load['loc'] = fn_.tell()
-            payload['load'] = self.auth.crypticle.dumps(load)
-            self.socket.send(self.serial.dumps(payload))
-            data = self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+            try:
+                data = self.auth.crypticle.loads(
+                        self.sreq.send(
+                            'aes',
+                            self.auth.crypticle.dumps(load),
+                            3,
+                            60)
+                        )
+            except SaltReqTimeoutError:
+                return ''
             if not data['data']:
                 if not fn_ and data['dest']:
                     # This is a 0 byte file on the master
                     with self._cache_loc(data['dest'], env) as cache_dest:
                         dest = cache_dest
                         if not os.path.exists(cache_dest):
-                            with open(cache_dest, 'w+') as f:
+                            with open(cache_dest, 'wb+') as f:
                                 f.write(data['data'])
                 break
             if not fn_:
                 with self._cache_loc(data['dest'], env) as cache_dest:
                     dest = cache_dest
-                    fn_ = open(dest, 'w+')
+                    fn_ = open(dest, 'wb+')
             fn_.write(data['data'])
         if fn_:
             fn_.close()
@@ -595,23 +582,35 @@ class RemoteClient(Client):
         '''
         List the files on the master
         '''
-        payload = {'enc': 'aes'}
         load = {'env': env,
                 'cmd': '_file_list'}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(
+                    self.sreq.send(
+                        'aes',
+                        self.auth.crypticle.dumps(load),
+                        3,
+                        60)
+                    )
+        except SaltReqTimeoutError:
+            return ''
 
     def file_list_emptydirs(self, env='base'):
         '''
         List the empty dirs on the master
         '''
-        payload = {'enc': 'aes'}
         load = {'env': env,
                 'cmd': '_file_list_emptydirs'}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(
+                    self.sreq.send(
+                        'aes',
+                        self.auth.crypticle.dumps(load),
+                        3,
+                        60)
+                    )
+        except SaltReqTimeoutError:
+            return ''
 
     def hash_file(self, path, env='base'):
         '''
@@ -633,43 +632,67 @@ class RemoteClient(Client):
                     ret['hsum'] = hashlib.md5(f.read()).hexdigest()
                 ret['hash_type'] = 'md5'
                 return ret
-        payload = {'enc': 'aes'}
         load = {'path': path,
                 'env': env,
                 'cmd': '_file_hash'}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(
+                    self.sreq.send(
+                        'aes',
+                        self.auth.crypticle.dumps(load),
+                        3,
+                        60)
+                    )
+        except SaltReqTimeoutError:
+            return ''
 
     def list_env(self, path, env='base'):
         '''
         Return a list of the files in the file server's specified environment
         '''
-        payload = {'enc': 'aes'}
         load = {'env': env,
                 'cmd': '_file_list'}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(
+                    self.sreq.send(
+                        'aes',
+                        self.auth.crypticle.dumps(load),
+                        3,
+                        60)
+                    )
+        except SaltReqTimeoutError:
+            return ''
 
     def master_opts(self):
         '''
         Return the master opts data
         '''
-        payload = {'enc': 'aes'}
         load = {'cmd': '_master_opts'}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(
+                    self.sreq.send(
+                        'aes',
+                        self.auth.crypticle.dumps(load),
+                        3,
+                        60)
+                    )
+        except SaltReqTimeoutError:
+            return ''
 
     def ext_nodes(self):
         '''
         Return the metadata derived from the external nodes system on the
         master.
         '''
-        payload = {'enc': 'aes'}
         load = {'cmd': '_ext_nodes',
                 'id': self.opts['id']}
-        payload['load'] = self.auth.crypticle.dumps(load)
-        self.socket.send(self.serial.dumps(payload))
-        return self.auth.crypticle.loads(self.serial.loads(self.socket.recv()))
+        try:
+            return self.auth.crypticle.loads(
+                    self.sreq.send(
+                        'aes',
+                        self.auth.crypticle.dumps(load),
+                        3,
+                        60)
+                    )
+        except SaltReqTimeoutError:
+            return ''

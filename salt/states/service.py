@@ -28,11 +28,11 @@ def _get_stat(name, sig):
     stat = False
     if sig:
         if sig == 'detect':
-            cmd = "{0[ps]} | grep {1} | grep -v grep | awk '{{print $2}}'".format(
-                        __grains__, name)
+            cmd = "{0[ps]} | grep {1} | grep -v grep | awk '{{print $2}}'"
+            cmd = cmd.format(__grains__, name)
         else:
-            cmd = "{0[ps]} | grep {1} | grep -v grep | awk '{{print $2}}'".format(
-                        __grains__, sig)
+            cmd = "{0[ps]} | grep {1} | grep -v grep | awk '{{print $2}}'"
+            cmd = cmd.format(__grains__, sig)
         stat = bool(__salt__['cmd.run'](cmd))
     else:
         stat = __salt__['service.status'](name)
@@ -67,7 +67,6 @@ def _enable(name, started):
     if __salt__['service.enabled'](name):
         # Service is enabled
         if started is True:
-            ret['changes'][name] = True
             ret['comment'] = ('Service {0} is already enabled,'
                 ' and is running').format(name)
             return ret
@@ -226,6 +225,7 @@ def running(name, enable=None, sig=None):
            'changes': {},
            'result': True,
            'comment': ''}
+    # See if the service is already running
     if _get_stat(name, sig):
         ret['comment'] = 'The service {0} is already running'.format(name)
         if enable is True:
@@ -235,6 +235,17 @@ def running(name, enable=None, sig=None):
         else:
             return ret
 
+    # Check if the service is available
+    if 'service.get_all' in __salt__:
+        # get_all is available, we can reliable check for the service
+        services = __salt__['service.get_all']()
+        if not name in services:
+            ret['result'] = False
+            ret['comment'] = 'The named service {0} is not available'.format(
+                    name)
+            return ret
+
+    # Run the tests
     if __opts__['test']:
         ret['result'] = None
         ret['comment'] = 'Service {0} is set to start'.format(name)
@@ -257,6 +268,8 @@ def running(name, enable=None, sig=None):
     elif enable is False:
         return _disable(name, True)
     else:
+        ret['changes'] = changes
+        ret['comment'] = 'Started Service {0}'.format(name)
         return ret
 
 
@@ -287,6 +300,17 @@ def dead(name, enable=None, sig=None):
             return _disable(name, None)
         else:
             return ret
+
+    # Check if the service is available
+    if 'service.get_all' in __salt__:
+        # get_all is available, we can reliable check for the service
+        services = __salt__['service.get_all']()
+        if not name in services:
+            ret['result'] = False
+            ret['comment'] = 'The named service {0} is not available'.format(
+                    name)
+            return ret
+
     if __opts__['test']:
         ret['result'] = None
         ret['comment'] = 'Service {0} is set to be killed'.format(name)
@@ -338,7 +362,7 @@ def disabled(name):
     return _disable(name, None)
 
 
-def mod_watch(name, sig=None, reload=False):
+def mod_watch(name, sig=None, reload=False, full_restart=False):
     '''
     The service watcher, called to invoke the watch command.
 
@@ -351,6 +375,8 @@ def mod_watch(name, sig=None, reload=False):
     if __salt__['service.status'](name, sig):
         if 'service.reload' in __salt__ and reload:
             changes = {name: __salt__['service.reload'](name)}
+        elif 'service.full_restart' in __salt__ and full_restart:
+            changes = {name: __salt__['service.full_restart'](name)}
         else:
             changes = {name: __salt__['service.restart'](name)}
         return {'name': name,
